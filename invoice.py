@@ -198,8 +198,84 @@ def extract_invoice_data(image, page_num):
             print(f"Attempt {attempt+1} failed, retrying: {str(e)}")
             time.sleep(2)  # Wait before retrying
 
-def process_pdf_invoices(pdf_path):
 
+def recheck_null_fields(image, page_num, current_data, null_fields):
+    """Re-extract only the null fields from a specific page"""
+    
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    
+    generation_config = {"temperature": 0.05, "max_output_tokens": 1000}
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        generation_config=generation_config,
+    )
+    
+    # Create focused prompt for only the null fields
+    field_descriptions = {
+        "Company name": "Extracted from the header/title area of the document.",
+        
+        "Order number": "order/shipper number (labels: SHIPPER NUMBER, SHIPPER, Order Number:, Order No:, Reference Number:, ORD, ORD#, BILL TO)",
+        
+        "Tracking number": "invoice/tracking number (labels: INVOICE#:, ORIGINAL INVOICE, Invoice Number:, Invoice No:, Tracking Number:, Pro#)",
+        
+        "Customer Po number": "PO number (labels: P.O. NUMBER, PO#:, PO Number:, Purchase Order:, Customer PO:)",
+        "Total Charges": "total amount (labels: PLEASE PAY THIS AMOUNT, Total Due:, Total:, Amount Due:, Balance Due:, Total Amount:)"
+}
+
+    
+    missing_fields = []
+    for field in null_fields:
+        if field in field_descriptions:
+            missing_fields.append(f"- {field}: {field_descriptions[field]}")
+    
+    prompt = f"""
+    Look at this document and find ONLY these missing fields:
+    
+    {chr(10).join(missing_fields)}
+    
+    Search every part of the document carefully. Look for any text that matches these field types.
+    
+    Return ONLY this JSON format:
+    {{
+      {', '.join([f'"{field}": "value or null"' for field in null_fields])}
+    }}
+    
+    No markdown formatting. If you can't find a field, use null.
+    """
+    
+    try:
+        chat = model.start_chat()
+        response = chat.send_message([
+            prompt,
+            {
+                "mime_type": "image/png",
+                "data": image_base64
+            }
+        ])
+        
+        response_text = response.text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        response_text = response_text.strip()
+        
+        result = json.loads(response_text)
+        print(f"Page {page_num} - Rechecked fields: {result}")
+        return result
+        
+    except Exception as e:
+        print(f"Page {page_num} - Recheck failed: {str(e)}")
+        return {field: None for field in null_fields}
+
+
+
+
+def process_pdf_invoices(pdf_path):
     # Convert PDF to images
     page_count, images = pdf_to_images(pdf_path)
     print(f"PDF has {page_count} pages")
@@ -211,17 +287,47 @@ def process_pdf_invoices(pdf_path):
         page_num = i + 1
         print(f"Processing page {page_num}...")
         
-        # Check if the page is an invoice
-        if is_invoice_page(image):
-            print(f"Page {page_num} is an invoice. Extracting data...")
-            
-            # Extract data from the invoice
-            invoice_data = extract_invoice_data(image, page_num)
-            results.append(invoice_data)
-        else:
-            print(f"Page {page_num} is not an invoice. Skipping...")
+        try:
+            # Check if the page is an invoice
+            if is_invoice_page(image):
+                print(f"Page {page_num} is an invoice. Extracting data...")
+                
+                # Extract data from the invoice
+                invoice_data = extract_invoice_data(image, page_num)
+                
+                # Validate that we got meaningful data
+                has_data = any(v for k, v in invoice_data.items() 
+                             if k not in ["page_no", "error"] and v is not None)
+                
+                if has_data:
+                    results.append(invoice_data)
+                    print(f"Page {page_num} - Successfully extracted data")
+                else:
+                    print(f"Page {page_num} - No meaningful data extracted, retrying...")
+                    invoice_data = extract_invoice_data(image, page_num)
+                    results.append(invoice_data)
+            else:
+                print(f"Page {page_num} is not an invoice. Skipping...")
+                
+        except Exception as e:
+            print(f"Error processing page {page_num}: {str(e)}")
+            results.append({
+                "page_no": page_num,
+                "error": str(e),
+                "Trucking Company name": None,
+                "Order number": None,
+                "Tracking number": None,
+                "Customer Po number": None,
+                "Total Charges": None
+            })
     
-    return results
+    # Clean up data first
+    cleaned_results = validate_and_cleanup_data(results)
+    
+    # *** NEW: Final null validation - check and fill null values ***
+    final_results = final_null_validation(cleaned_results, images)
+    
+    return final_results
 
 def validate_and_cleanup_data(invoice_data_list):
 
@@ -280,6 +386,58 @@ def validate_and_cleanup_data(invoice_data_list):
     
     return cleaned_data
 
+
+def final_null_validation(invoice_data_list, images):
+    """Check final JSON for null values and re-extract them"""
+    
+    print("=== FINAL NULL CHECK STARTED ===")
+    
+    for invoice in invoice_data_list:
+        page_num = invoice.get("page_no")
+        if not page_num or page_num > len(images):
+            continue
+            
+        # Find which fields are null
+        null_fields = []
+        for field in ["Trucking Company name", "Order number", "Tracking number", "Customer Po number", "Total Charges"]:
+            if invoice.get(field) is None:
+                null_fields.append(field)
+        
+        # If there are null fields, go back to that page and re-check
+        if null_fields:
+            print(f"Page {page_num} has NULL fields: {null_fields}")
+            print(f"Going back to page {page_num} to re-extract...")
+            
+            try:
+                # Get the image for this page
+                image = images[page_num - 1]  # Convert to 0-based index
+                
+                # Re-extract only the null fields
+                rechecked_data = recheck_null_fields(image, page_num, invoice, null_fields)
+                
+                # Update the invoice with any found values
+                updated_count = 0
+                for field, value in rechecked_data.items():
+                    if value is not None and str(value).lower() != "null" and str(value).strip() != "":
+                        # Format Total Charges with $
+                        if field == "Total Charges" and not str(value).startswith("$"):
+                            value = f"${value}"
+                        
+                        invoice[field] = value
+                        print(f"✓ Updated {field}: {value}")
+                        updated_count += 1
+                
+                print(f"Page {page_num}: Updated {updated_count} out of {len(null_fields)} null fields")
+                
+            except Exception as e:
+                print(f"Error rechecking page {page_num}: {str(e)}")
+        else:
+            print(f"Page {page_num}: No null fields found")
+    
+    print("=== FINAL NULL CHECK COMPLETED ===")
+    return invoice_data_list
+
+
 def process_pdf(pdf_path, output_path=None):
     # Process the PDF
     invoice_data = process_pdf_invoices(pdf_path)
@@ -291,20 +449,15 @@ def process_pdf(pdf_path, output_path=None):
 
 @app.route('/process-invoice', methods=['POST'])
 def process_invoice():
-    # Check if file is in the request
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
     
     file = request.files['file']
     
-    # If user does not select file, browser also
-    # submit an empty part without filename
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     
     try:
-        # Process the PDF directly from the uploaded file object
-        # Create a PyMuPDF document directly from the file data
         file_data = file.read()
         pdf_document = fitz.open("pdf", file_data)
         
@@ -312,23 +465,14 @@ def process_invoice():
         page_count = pdf_document.page_count
         image_list = []
         
-        # Iterate through each page
         for page_number in range(page_count):
-            # Get the page
             page = pdf_document[page_number]
-            
-            # Convert to a high-quality pixmap
             pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72))
-            
-            # Convert pixmap to PIL Image
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             image_list.append(img)
-            
             print(f"Processed page {page_number + 1} of {page_count}")
         
-        # Close the PDF
         pdf_document.close()
-        
         print(f"PDF has {page_count} pages")
         
         # Process each page
@@ -338,23 +482,46 @@ def process_invoice():
             page_num = i + 1
             print(f"Processing page {page_num}...")
             
-            # Check if the page is an invoice
-            if is_invoice_page(image):
-                print(f"Page {page_num} is an invoice. Extracting data...")
-                
-                # Extract data from the invoice
-                invoice_data = extract_invoice_data(image, page_num)
-                results.append(invoice_data)
-            else:
-                print(f"Page {page_num} is not an invoice. Skipping...")
+            try:
+                if is_invoice_page(image):
+                    print(f"Page {page_num} is an invoice. Extracting data...")
+                    
+                    invoice_data = extract_invoice_data(image, page_num)
+                    
+                    has_data = any(v for k, v in invoice_data.items() 
+                                 if k not in ["page_no", "error"] and v is not None)
+                    
+                    if has_data:
+                        results.append(invoice_data)
+                        print(f"Page {page_num} - Successfully extracted data")
+                    else:
+                        print(f"Page {page_num} - No meaningful data extracted, retrying...")
+                        invoice_data = extract_invoice_data(image, page_num)
+                        results.append(invoice_data)
+                else:
+                    print(f"Page {page_num} is not an invoice. Skipping...")
+                    
+            except Exception as e:
+                print(f"Error processing page {page_num}: {str(e)}")
+                results.append({
+                    "page_no": page_num,
+                    "error": str(e),
+                    "Trucking Company name": None,
+                    "Order number": None,
+                    "Tracking number": None,
+                    "Customer Po number": None,
+                    "Total Charges": None
+                })
         
         # Validate and clean up the data
         cleaned_data = validate_and_cleanup_data(results)
         
-        print(f"Found {len(cleaned_data)} invoices in the PDF")
+        # *** NEW: Final null validation - check and fill null values ***
+        final_data = final_null_validation(cleaned_data, image_list)
         
-        # Return the results
-        return jsonify(cleaned_data)
+        print(f"Found {len(final_data)} invoices in the PDF")
+        
+        return jsonify(final_data)
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
