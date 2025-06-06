@@ -111,20 +111,20 @@ def extract_invoice_data(image, page_num):
     prompt = """
     Analyze this invoice image and extract the following information precisely. Be flexible about how the information is labeled in the document.
     
+    Fileds to extract:
     1. The company name (look at the header/title area for the company name providing the service)
     
-    2. The tracking number / invoice number (look for any of these labels: 
-       "INVOICE#:","ORIGINAL INVOICE", "Invoice Number:", "Invoice No:", "Tracking Number:", "Pro#", etc.)
+    2. The tracking number / invoice number (look for any of these labels): 
+       ["INVOICE#:","ORIGINAL INVOICE", "Invoice Number:", "Invoice No:", "Tracking Number:", "Pro#", etc.]
     
-    3. The order number (look for any of these labels: 
-       "SHIPPER NUMBER", "SHIPPER", "Order Number:", "Order No:", "Reference Number:", "ORD", "ORD#", "BILL TO", etc.)
+    3. The order number (look for any of these labels ): 
+       ["SHIPPER NUMBER", "SHIPPER", "Order Number:", "Order No:", "Reference Number:", "ORD", "ORD#", "BILL TO", etc.] 
     
-    4. The customer PO number (look for any of these labels: 
-       "P.O. NUMBER", "PO#:", "PO Number:", "Purchase Order:", "Customer PO:", etc.)
+    4. The customer PO number (look for any of these labels ): 
+       ["P.O. NUMBER", "PO#:", "PO Number:", "Purchase Order:", "Customer PO:", etc.]
     
-    5. The total charges amount (look for any of these labels: 
-       "PLEASE PAY THIS AMOUNT", "Total Due:", "Total:", "Amount Due:", 
-       "Balance Due:", "Total Amount:", etc.)
+    5. The total charges amount (look for any of these labels ): 
+       ["PLEASE PAY THIS AMOUNT", "Total Due:", "Total:", "Amount Due:", "Balance Due:", "Total Amount:", etc.]
     
     Return the information in the following JSON format (and ONLY this format with no additional text):
     {
@@ -137,12 +137,12 @@ def extract_invoice_data(image, page_num):
     }
     
     IMPORTANT INSTRUCTIONS: 
+    - Follow the as is rule for field extraction as mentioned above
+    - for each field, look for the mentioned labels in the document
     - Do NOT include any markdown formatting like ```json or ``` in your response
-    - If any information is not found, use null for that field
+    - Check each field carefully and ensure it is the most relevant/exact match
     - Include the dollar sign ($) with the Total Charges
-    - The goal is to extract the semantic meaning of each field, not just match exact labels
-    - If you see multiple potential matches for a field, use the most appropriate one
-    - Use your best judgment to identify the correct information
+    - If you see multiple potential matches for a field, use the lable mentioned above or the most relevant one
     """
     
     # Use retry mechanism for API calls
