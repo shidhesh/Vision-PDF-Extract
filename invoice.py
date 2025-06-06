@@ -146,7 +146,7 @@ def extract_invoice_data(image, page_num):
     """
     
     # Use retry mechanism for API calls
-    max_retries = 3
+    max_retries = 10
     for attempt in range(max_retries):
         try:
             # Start a chat and send the image for processing
@@ -196,7 +196,7 @@ def extract_invoice_data(image, page_num):
                     "page_no": page_num
                 }
             print(f"Attempt {attempt+1} failed, retrying: {str(e)}")
-            time.sleep(2)  # Wait before retrying
+            time.sleep(4)  # Wait before retrying
 
 
 def recheck_null_fields(image, page_num, current_data, null_fields):
