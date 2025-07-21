@@ -15,7 +15,6 @@ app = Flask(__name__)
 genai.configure(api_key= os.getenv("Google_API_key"))  # Replace with your actual API key
 
 def pdf_to_images(pdf_path):
-
     # Open the PDF
     pdf_document = fitz.open(pdf_path)
     page_count = pdf_document.page_count
@@ -41,38 +40,49 @@ def pdf_to_images(pdf_path):
     return page_count, image_list
 
 def is_invoice_page(image):
-
     # Convert image to base64 for API request
     buffered = io.BytesIO()
     image.save(buffered, format="PNG")
     image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
     
-    # Configure the Gemini model
-    generation_config = {"temperature": 0.2, "max_output_tokens": 100}
+    # FIXED: Deterministic settings for consistent results
+    generation_config = {
+        "temperature": 0.1, 
+        "max_output_tokens": 50,
+        "top_p": 1.0,
+        "top_k": 1
+    }
     model = genai.GenerativeModel(
         model_name="gemini-2.0-flash",
         generation_config=generation_config,
     )
     
-    # Prompt to determine if this is an invoice
+    # ENHANCED: More specific prompt to better identify actual invoices
     prompt = """
-    Analyze this document and determine if it is specifically an INVOICE (not a delivery bill, packing slip, or other document).
+    Look at this document and determine if it contains invoice information for billing purposes.
     
-    Look for these invoice indicators:
-    1. The presence of "INVOICE" in the header/title
-    2. An invoice number or tracking number
+    An invoice should have:
+    1. The word "INVOICE" visible on header/somewhere in the document
+    2. A company name providing the service
+    3. Billing amounts or charges
+    4. An invoice/tracking/PRO number
     
-    If this is clearly an invoice, answer "yes".
-    If this is any other type of document (delivery bill, packing slip, order confirmation, etc.), answer "no".
+    REJECT only if:
+    - This is clearly a delivery receipt (says "DELIVERY RECEIPT" at top)
+    - This is a packing slip without billing information
+    - This page has no billing/charging information at all
+    - This page has no "INVOICE" text anywhere
     
-    Answer ONLY "yes" or "no" with no additional text.
+    If you see "INVOICE" text and billing information, answer "yes".
+    If this is clearly not an invoice document, answer "no".
     """
     
-    # Use retry mechanism for API calls
-    max_retries = 3
+    # FIXED: Single deterministic call to avoid inconsistency
+    max_retries = 5  # Increased retries for reliability
+    
     for attempt in range(max_retries):
         try:
-            # Start a chat and send the image for processing
+            # Use a fresh chat session each time for consistency
             chat = model.start_chat()
             response = chat.send_message([
                 prompt,
@@ -82,36 +92,64 @@ def is_invoice_page(image):
                 }
             ])
             
-            # Check if response indicates this is an invoice
+            # Clean and parse response
             result = response.text.lower().strip()
-            return 'yes' in result
+            result = result.replace(".", "").replace(",", "").replace("!", "")
             
+            print(f"Invoice detection attempt {attempt + 1}: '{result}'")
+            
+            # Strict yes/no checking
+            if result == "yes":
+                return True
+            elif result == "no":
+                return False
+            elif "yes" in result and "no" not in result:
+                return True
+            elif "no" in result and "yes" not in result:
+                return False
+            else:
+                # Ambiguous response, retry
+                if attempt < max_retries - 1:
+                    print(f"Ambiguous response: '{result}', retrying...")
+                    time.sleep(1)
+                    continue
+                else:
+                    print(f"Final ambiguous response, defaulting to False")
+                    return False
+                
         except Exception as e:
+            print(f"Attempt {attempt+1} failed: {str(e)}")
             if attempt == max_retries - 1:
-                print(f"Failed to determine document type after {max_retries} attempts: {str(e)}")
-                return False  # Default to False if we can't determine
-            print(f"Attempt {attempt+1} failed, retrying: {str(e)}")
-            time.sleep(2)  # Wait before retrying
+                print(f"All attempts failed, defaulting to False")
+                return False
+            time.sleep(2)
+    
+    return False
 
 def extract_invoice_data(image, page_num):
-
     # Convert image to base64 for API request
     buffered = io.BytesIO()
     image.save(buffered, format="PNG")
     image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
     
-    # Configure the Gemini model
-    generation_config = {"temperature": 0.2, "max_output_tokens": 2000}
+    # FIXED: Fully deterministic settings for consistent results
+    generation_config = {
+        "temperature": 0.0, 
+        "max_output_tokens": 2000,
+        "top_p": 1.0,
+        "top_k": 1
+    }
     model = genai.GenerativeModel(
         model_name="gemini-2.0-flash",
         generation_config=generation_config,
     )
     
-    # Detailed prompt for invoice data extraction with flexibility for field names
+    # ENHANCED: More specific validation in the prompt
     prompt = """
-    Analyze this invoice image and extract the following information precisely. Be flexible about how the information is labeled in the document.
+    Analyze this invoice image and extract the following information precisely. 
+    IMPORTANT: Only proceed if this is clearly an invoice with billing information.
     
-    Fileds to extract:
+    Fields to extract:
     1. The company name (look at the header/title area for the company name providing the service)
     
     2. The tracking number / invoice number (look for any of these labels): 
@@ -126,9 +164,26 @@ def extract_invoice_data(image, page_num):
     5. The total charges amount (look for any of these labels ): 
        ["PLEASE PAY THIS AMOUNT", "Total Due:", "Total:", "Amount Due:", "Balance Due:", "Total Amount:", etc.]
     
-    Return the information in the following JSON format (and ONLY this format with no additional text):
+    VALIDATION: Before extracting, verify this is an actual invoice:
+    - Must have "INVOICE" in the header
+    - Must have billing/charging information
+    - Must not be a delivery receipt or packing slip
+    
+    If this is NOT a valid invoice page, return:
     {
       "page_no": [PAGE NUMBER],
+      "is_valid_invoice": false,
+      "Trucking Company name": null,
+      "Order number": null,
+      "Tracking number": null,
+      "Customer Po number": null,
+      "Total Charges": null
+    }
+    
+    If this IS a valid invoice, return the information in this JSON format:
+    {
+      "page_no": [PAGE NUMBER],
+      "is_valid_invoice": true,
       "Trucking Company name": [COMPANY NAME],
       "Order number": [ORDER NUMBER],
       "Tracking number": [INVOICE/TRACKING NUMBER],
@@ -142,14 +197,15 @@ def extract_invoice_data(image, page_num):
     - Do NOT include any markdown formatting like ```json or ``` in your response
     - Check each field carefully and ensure it is the most relevant/exact match
     - Include the dollar sign ($) with the Total Charges
-    - If you see multiple potential matches for a field, use the lable mentioned above or the most relevant one
+    - If you see multiple potential matches for a field, use the label mentioned above or the most relevant one
     """
     
-    # Use retry mechanism for API calls
-    max_retries = 10
+    # FIXED: Single deterministic extraction to avoid inconsistent results
+    max_retries = 5  # Increased for reliability
+    
     for attempt in range(max_retries):
         try:
-            # Start a chat and send the image for processing
+            # Use fresh chat session for consistency
             chat = model.start_chat()
             response = chat.send_message([
                 prompt,
@@ -161,14 +217,41 @@ def extract_invoice_data(image, page_num):
             
             # Clean response text to remove any markdown or code block formatting
             response_text = response.text.strip()
+            
+            # Remove markdown formatting
             if response_text.startswith("```json"):
                 response_text = response_text[7:]
+            elif response_text.startswith("```"):
+                response_text = response_text[3:]
             if response_text.endswith("```"):
                 response_text = response_text[:-3]
             response_text = response_text.strip()
             
-            # Parse the cleaned response as JSON
-            result = json.loads(response_text)
+            print(f"Extraction attempt {attempt + 1}: Response length: {len(response_text)}")
+            
+            # Try to parse as JSON
+            try:
+                result = json.loads(response_text)
+            except json.JSONDecodeError as e:
+                print(f"JSON parse error on attempt {attempt + 1}: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                else:
+                    raise e
+            
+            # ADDED: Check if this is marked as invalid invoice
+            if result.get("is_valid_invoice") == False:
+                return {
+                    "page_no": page_num,
+                    "is_valid_invoice": False,
+                    "skip_reason": "Not a valid invoice page",
+                    "Trucking Company name": None,
+                    "Order number": None,
+                    "Tracking number": None,
+                    "Customer Po number": None,
+                    "Total Charges": None
+                }
             
             # Ensure all required fields are present
             required_fields = ["Trucking Company name", "Order number", "Tracking number", "Customer Po number", "Total Charges"]
@@ -176,8 +259,9 @@ def extract_invoice_data(image, page_num):
                 if field not in result:
                     result[field] = None
             
-            # Set page number
+            # Set page number and validation flag
             result["page_no"] = page_num
+            result["is_valid_invoice"] = True
             
             # Format Total Charges with dollar sign if not present and not null
             if result["Total Charges"] and not isinstance(result["Total Charges"], str):
@@ -185,19 +269,44 @@ def extract_invoice_data(image, page_num):
             elif result["Total Charges"] and isinstance(result["Total Charges"], str) and not result["Total Charges"].startswith("$"):
                 result["Total Charges"] = f"${result['Total Charges']}"
             
-            return result
+            # ADDED: Validate that we have meaningful data
+            meaningful_fields = [
+                result.get("Trucking Company name"),
+                result.get("Tracking number"), 
+                result.get("Total Charges")
+            ]
+            
+            # If we have at least one meaningful field, return the result
+            if any(field and str(field).lower() not in ['null', 'none', ''] for field in meaningful_fields):
+                print(f"Extraction successful on attempt {attempt + 1}")
+                return result
+            else:
+                print(f"No meaningful data found on attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                else:
+                    # Return the result even if no meaningful data
+                    return result
             
         except Exception as e:
+            print(f"Extraction attempt {attempt + 1} failed: {str(e)}")
             if attempt == max_retries - 1:
-                print(f"Failed to extract data after {max_retries} attempts: {str(e)}")
+                print(f"Failed to extract data after {max_retries} attempts")
                 return {
                     "error": "Failed to parse invoice data",
                     "raw_response": response.text if 'response' in locals() else "No response",
-                    "page_no": page_num
+                    "page_no": page_num,
+                    "is_valid_invoice": False
                 }
-            print(f"Attempt {attempt+1} failed, retrying: {str(e)}")
-            time.sleep(4)  # Wait before retrying
-
+            time.sleep(3)
+    
+    # Fallback return
+    return {
+        "error": "No successful extraction",
+        "page_no": page_num,
+        "is_valid_invoice": False
+    }
 
 def recheck_null_fields(image, page_num, current_data, null_fields):
     """Re-extract only the null fields from a specific page"""
@@ -206,7 +315,8 @@ def recheck_null_fields(image, page_num, current_data, null_fields):
     image.save(buffered, format="PNG")
     image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
     
-    generation_config = {"temperature": 0.05, "max_output_tokens": 1000}
+    # FIXED: Consistent temperature
+    generation_config = {"temperature": 0.0, "max_output_tokens": 1000}
     model = genai.GenerativeModel(
         model_name="gemini-2.0-flash",
         generation_config=generation_config,
@@ -214,16 +324,12 @@ def recheck_null_fields(image, page_num, current_data, null_fields):
     
     # Create focused prompt for only the null fields
     field_descriptions = {
-        "Company name": "Extracted from the header/title area of the document.",
-        
+        "Trucking Company name": "Extracted from the header/title area of the document.",
         "Order number": "order/shipper number (labels: SHIPPER NUMBER, SHIPPER, Order Number:, Order No:, Reference Number:, ORD, ORD#, BILL TO)",
-        
         "Tracking number": "invoice/tracking number (labels: INVOICE#:, ORIGINAL INVOICE, Invoice Number:, Invoice No:, Tracking Number:, Pro#)",
-        
         "Customer Po number": "PO number (labels: P.O. NUMBER, PO#:, PO Number:, Purchase Order:, Customer PO:)",
         "Total Charges": "total amount (labels: PLEASE PAY THIS AMOUNT, Total Due:, Total:, Amount Due:, Balance Due:, Total Amount:)"
-}
-
+    }
     
     missing_fields = []
     for field in null_fields:
@@ -272,9 +378,6 @@ def recheck_null_fields(image, page_num, current_data, null_fields):
         print(f"Page {page_num} - Recheck failed: {str(e)}")
         return {field: None for field in null_fields}
 
-
-
-
 def process_pdf_invoices(pdf_path):
     # Convert PDF to images
     page_count, images = pdf_to_images(pdf_path)
@@ -282,92 +385,89 @@ def process_pdf_invoices(pdf_path):
     
     # Process each page
     results = []
+    found_primary_invoice = False  # Track if we found the main invoice
     
     for i, image in enumerate(images):
         page_num = i + 1
         print(f"Processing page {page_num}...")
         
+        # ADDED: If we already found a primary invoice, be more strict about additional pages
+        if found_primary_invoice:
+            print(f"Page {page_num} - Primary invoice already found, checking if this is a valid secondary invoice...")
+        
         try:
-            # Check if the page is an invoice
+            # ENHANCED: Check if the page is an invoice with better validation
             if is_invoice_page(image):
-                print(f"Page {page_num} is an invoice. Extracting data...")
+                print(f"Page {page_num} is identified as an invoice. Extracting data...")
                 
                 # Extract data from the invoice
                 invoice_data = extract_invoice_data(image, page_num)
                 
-                # Validate that we got meaningful data
-                has_data = any(v for k, v in invoice_data.items() 
-                             if k not in ["page_no", "error"] and v is not None)
+                # ADDED: Check if extraction marked this as invalid
+                if invoice_data.get("is_valid_invoice") == False:
+                    print(f"Page {page_num} - Marked as invalid invoice during extraction. Skipping...")
+                    continue
                 
-                if has_data:
+                # Validate that we got meaningful data
+                has_meaningful_data = any(
+                    v and str(v).lower() not in ['null', 'none', ''] 
+                    for k, v in invoice_data.items() 
+                    if k in ["Trucking Company name", "Tracking number", "Total Charges"]
+                )
+                
+                if has_meaningful_data:
+                    # ADDED: Check for duplicate invoice detection
+                    if found_primary_invoice:
+                        # Check if this is a duplicate of already found invoice
+                        existing_tracking = [r.get("Tracking number") for r in results if r.get("Tracking number")]
+                        current_tracking = invoice_data.get("Tracking number")
+                        
+                        if current_tracking and current_tracking in existing_tracking:
+                            print(f"Page {page_num} - Duplicate invoice detected (same tracking number). Skipping...")
+                            continue
+                        else:
+                            print(f"Page {page_num} - Additional unique invoice found")
+                    else:
+                        found_primary_invoice = True
+                        print(f"Page {page_num} - Primary invoice found")
+                    
                     results.append(invoice_data)
                     print(f"Page {page_num} - Successfully extracted data")
                 else:
-                    print(f"Page {page_num} - No meaningful data extracted, retrying...")
-                    invoice_data = extract_invoice_data(image, page_num)
-                    results.append(invoice_data)
+                    print(f"Page {page_num} - No meaningful data extracted, skipping...")
             else:
                 print(f"Page {page_num} is not an invoice. Skipping...")
                 
         except Exception as e:
             print(f"Error processing page {page_num}: {str(e)}")
-            results.append({
-                "page_no": page_num,
-                "error": str(e),
-                "Trucking Company name": None,
-                "Order number": None,
-                "Tracking number": None,
-                "Customer Po number": None,
-                "Total Charges": None
-            })
+            continue
+    
+    # ADDED: Filter out invalid invoices before processing
+    valid_results = [r for r in results if r.get("is_valid_invoice") != False]
+    
+    if not valid_results:
+        print("No valid invoices found in the PDF")
+        return []
+    
+    print(f"Found {len(valid_results)} valid invoice(s) in the PDF")
     
     # Clean up data first
-    cleaned_results = validate_and_cleanup_data(results)
+    cleaned_results = validate_and_cleanup_data(valid_results)
     
-    # *** NEW: Final null validation - check and fill null values ***
+    # Final null validation - check and fill null values
     final_results = final_null_validation(cleaned_results, images)
+    
+    # ADDED: Final deduplication check
+    final_results = remove_duplicate_invoices(final_results)
     
     return final_results
 
 def validate_and_cleanup_data(invoice_data_list):
-
     cleaned_data = []
     
     for invoice in invoice_data_list:
-        # Skip entries with errors
-        if "error" in invoice:
-            # Try to salvage some information if available
-            if "raw_response" in invoice:
-                try:
-                    # Try to extract JSON from the raw response
-                    raw_text = invoice["raw_response"]
-                    if isinstance(raw_text, str):
-                        # Clean up the text
-                        for prefix in ["```json", "```"]:
-                            if raw_text.startswith(prefix):
-                                raw_text = raw_text[len(prefix):]
-                        for suffix in ["```"]:
-                            if raw_text.endswith(suffix):
-                                raw_text = raw_text[:-len(suffix)]
-                        raw_text = raw_text.strip()
-                        
-                        # Try to parse as JSON
-                        cleaned_invoice = json.loads(raw_text)
-                        cleaned_invoice["page_no"] = invoice["page_no"]
-                        cleaned_data.append(cleaned_invoice)
-                        continue
-                except:
-                    pass
-            
-            # If we couldn't salvage data, create a minimal entry
-            cleaned_data.append({
-                "page_no": invoice["page_no"],
-                "Trucking Company name": None,
-                "Order number": None,
-                "Tracking number": None,
-                "Customer Po number": None,
-                "Total Charges": None
-            })
+        # Skip entries with errors or invalid invoices
+        if "error" in invoice or invoice.get("is_valid_invoice") == False:
             continue
             
         # Ensure all fields exist
@@ -386,6 +486,31 @@ def validate_and_cleanup_data(invoice_data_list):
     
     return cleaned_data
 
+def remove_duplicate_invoices(invoice_data_list):
+    """Remove duplicate invoices based on tracking number and total charges"""
+    
+    if not invoice_data_list:
+        return invoice_data_list
+    
+    unique_invoices = []
+    seen_combinations = set()
+    
+    for invoice in invoice_data_list:
+        tracking_num = invoice.get("Tracking number")
+        total_charges = invoice.get("Total Charges")
+        
+        # Create a unique identifier
+        identifier = f"{tracking_num}_{total_charges}"
+        
+        if identifier not in seen_combinations:
+            seen_combinations.add(identifier)
+            unique_invoices.append(invoice)
+            print(f"Keeping invoice from page {invoice.get('page_no')} - Tracking: {tracking_num}")
+        else:
+            print(f"Removing duplicate invoice from page {invoice.get('page_no')} - Tracking: {tracking_num}")
+    
+    print(f"Deduplication: {len(invoice_data_list)} -> {len(unique_invoices)} invoices")
+    return unique_invoices
 
 def final_null_validation(invoice_data_list, images):
     """Check final JSON for null values and re-extract them"""
@@ -437,7 +562,6 @@ def final_null_validation(invoice_data_list, images):
     print("=== FINAL NULL CHECK COMPLETED ===")
     return invoice_data_list
 
-
 def process_pdf(pdf_path, output_path=None):
     # Process the PDF
     invoice_data = process_pdf_invoices(pdf_path)
@@ -482,46 +606,90 @@ def process_invoice():
             page_num = i + 1
             print(f"Processing page {page_num}...")
             
+            # ADDED: If we already found a primary invoice, be more strict about additional pages
+            if len(results) > 0:
+                print(f"Page {page_num} - Primary invoice already found, checking if this is a valid secondary invoice...")
+            
             try:
+                # ENHANCED: Better invoice validation
                 if is_invoice_page(image):
-                    print(f"Page {page_num} is an invoice. Extracting data...")
+                    print(f"Page {page_num} is identified as an invoice. Extracting data...")
                     
                     invoice_data = extract_invoice_data(image, page_num)
                     
-                    has_data = any(v for k, v in invoice_data.items() 
-                                 if k not in ["page_no", "error"] and v is not None)
+                    # ADDED: Check if extraction marked this as invalid
+                    if invoice_data.get("is_valid_invoice") == False:
+                        print(f"Page {page_num} - Marked as invalid invoice during extraction. Skipping...")
+                        continue
                     
-                    if has_data:
+                    # Validate meaningful data
+                    has_meaningful_data = any(
+                        v and str(v).lower() not in ['null', 'none', ''] 
+                        for k, v in invoice_data.items() 
+                        if k in ["Trucking Company name", "Tracking number", "Total Charges"]
+                    )
+                    
+                    if has_meaningful_data:
+                        # ADDED: Check for duplicate invoice detection
+                        if len(results) > 0:
+                            # Check if this is a duplicate of already found invoice
+                            existing_tracking = [r.get("Tracking number") for r in results if r.get("Tracking number")]
+                            current_tracking = invoice_data.get("Tracking number")
+                            
+                            if current_tracking and current_tracking in existing_tracking:
+                                print(f"Page {page_num} - Duplicate invoice detected (same tracking number). Skipping...")
+                                continue
+                            else:
+                                print(f"Page {page_num} - Additional unique invoice found")
+                        else:
+                            print(f"Page {page_num} - Primary invoice found")
+                        
                         results.append(invoice_data)
                         print(f"Page {page_num} - Successfully extracted data")
                     else:
-                        print(f"Page {page_num} - No meaningful data extracted, retrying...")
-                        invoice_data = extract_invoice_data(image, page_num)
-                        results.append(invoice_data)
+                        print(f"Page {page_num} - No meaningful data extracted, skipping...")
                 else:
                     print(f"Page {page_num} is not an invoice. Skipping...")
                     
             except Exception as e:
                 print(f"Error processing page {page_num}: {str(e)}")
-                results.append({
-                    "page_no": page_num,
-                    "error": str(e),
-                    "Trucking Company name": None,
-                    "Order number": None,
-                    "Tracking number": None,
-                    "Customer Po number": None,
-                    "Total Charges": None
-                })
+                continue
+        
+        # ADDED: Filter out invalid invoices
+        valid_results = [r for r in results if r.get("is_valid_invoice") != False]
+        
+        if not valid_results:
+            print("No valid invoices found in the PDF")
+            return jsonify([])
         
         # Validate and clean up the data
-        cleaned_data = validate_and_cleanup_data(results)
+        cleaned_data = validate_and_cleanup_data(valid_results)
         
-        # *** NEW: Final null validation - check and fill null values ***
+        # Final null validation - check and fill null values
         final_data = final_null_validation(cleaned_data, image_list)
         
-        print(f"Found {len(final_data)} invoices in the PDF")
+        # ADDED: Final deduplication check
+        final_data = remove_duplicate_invoices(final_data)
+        
+        print(f"Found {len(final_data)} valid unique invoice(s) in the PDF")
         
         return jsonify(final_data)
+        
+        # valid_results = [r for r in results if r.get("is_valid_invoice") != False]
+        
+        # if not valid_results:
+        #     print("No valid invoices found in the PDF")
+        #     return jsonify([])
+        
+        # # Validate and clean up the data
+        # cleaned_data = validate_and_cleanup_data(valid_results)
+        
+        # # Final null validation - check and fill null values
+        # final_data = final_null_validation(cleaned_data, image_list)
+        
+        # print(f"Found {len(final_data)} valid invoices in the PDF")
+        
+        # return jsonify(final_data)
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
