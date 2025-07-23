@@ -1,6 +1,7 @@
 import os
 import base64
 import google.generativeai as genai
+from openai import OpenAI
 import fitz  # PyMuPDF
 import json
 from PIL import Image
@@ -8,11 +9,56 @@ import io
 import tempfile
 import time
 from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
-# Configure the Google Generative AI API
-genai.configure(api_key= os.getenv("Google_API_key"))  # Replace with your actual API key
+model = "gpt-4.1-mini-2025-04-14"  
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def resize_image_for_llm(image, max_size=(800, 800), quality=95):
+    """Resize image to fit within max_size box while maintaining aspect ratio"""
+    original_size = image.size
+    print(f"Original image size: {original_size}")
+    
+    # Calculate ratios for both dimensions
+    width_ratio = max_size[0] / original_size[0]
+    height_ratio = max_size[1] / original_size[1]
+    
+    # Use the smaller ratio to ensure image fits within the box
+    ratio = min(width_ratio, height_ratio)
+    
+    # Calculate new dimensions maintaining aspect ratio
+    new_width = int(original_size[0] * ratio)
+    new_height = int(original_size[1] * ratio)
+    
+    # Resize with exact proportions
+    resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    print(f"Resized image size: {resized_image.size} (ratio: {ratio:.3f})")
+    
+    # Convert to RGB if needed
+    if resized_image.mode in ("RGBA", "P"):
+        rgb_image = Image.new("RGB", resized_image.size, (255, 255, 255))
+        if resized_image.mode == "P":
+            resized_image = resized_image.convert("RGBA")
+        rgb_image.paste(resized_image, mask=resized_image.split()[-1] if resized_image.mode == "RGBA" else None)
+        resized_image = rgb_image
+    
+    # Save resized image to see the size
+    # resized_image.save(f"resized_page_{int(time.time())}.jpg", "JPEG", quality=quality)
+    
+    # Convert to base64
+    buffered = io.BytesIO()
+    resized_image.save(buffered, format="JPEG", quality=quality, optimize=True)
+    file_size_kb = len(buffered.getvalue()) / 1024
+    print(f"Compressed image size: {file_size_kb:.1f} KB")
+    
+    image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    return resized_image, image_base64
+
 
 def pdf_to_images(pdf_path):
     # Open the PDF
@@ -41,25 +87,14 @@ def pdf_to_images(pdf_path):
 
 def is_invoice_page(image):
     # Convert image to base64 for API request
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    # buffered = io.BytesIO()
+    # image.save(buffered, format="PNG")
+    # image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
     
-    # FIXED: Deterministic settings for consistent results
-    generation_config = {
-        "temperature": 0.1, 
-        "max_output_tokens": 50,
-        "top_p": 1.0,
-        "top_k": 1
-    }
-    model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
-        generation_config=generation_config,
-    )
+    resized_image, image_base64 = resize_image_for_llm(image)
     
-    # ENHANCED: More specific prompt to better identify actual invoices
     prompt = """
-    Look at this document and determine if it contains invoice information for billing purposes.
+    Look at this document and determine if it contains invoice information.
     
     An invoice should have:
     1. The word "INVOICE" visible on header/somewhere in the document
@@ -73,27 +108,40 @@ def is_invoice_page(image):
     - This page has no billing/charging information at all
     - This page has no "INVOICE" text anywhere
     
+    Strictly follow the above rules, do not make assumptions or guesses for invoice detection.
     If you see "INVOICE" text and billing information, answer "yes".
     If this is clearly not an invoice document, answer "no".
     """
     
-    # FIXED: Single deterministic call to avoid inconsistency
-    max_retries = 5  # Increased retries for reliability
+    max_retries = 5
     
     for attempt in range(max_retries):
         try:
-            # Use a fresh chat session each time for consistency
-            chat = model.start_chat()
-            response = chat.send_message([
-                prompt,
-                {
-                    "mime_type": "image/png",
-                    "data": image_base64
-                }
-            ])
+            response = client.chat.completions.create(
+                model=model,  # Using available model instead of the requested one
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_base64}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=50,
+                temperature=0.1,
+            )
             
-            # Clean and parse response
-            result = response.text.lower().strip()
+            # Get response text
+            result = response.choices[0].message.content.lower().strip()
             result = result.replace(".", "").replace(",", "").replace("!", "")
             
             print(f"Invoice detection attempt {attempt + 1}: '{result}'")
@@ -128,26 +176,15 @@ def is_invoice_page(image):
 
 def extract_invoice_data(image, page_num):
     # Convert image to base64 for API request
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    # buffered = io.BytesIO()
+    # image.save(buffered, format="PNG")
+    # image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
     
-    # FIXED: Fully deterministic settings for consistent results
-    generation_config = {
-        "temperature": 0.0, 
-        "max_output_tokens": 2000,
-        "top_p": 1.0,
-        "top_k": 1
-    }
-    model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
-        generation_config=generation_config,
-    )
+    resized_image, image_base64 = resize_image_for_llm(image)
     
-    # ENHANCED: More specific validation in the prompt
     prompt = """
     Analyze this invoice image and extract the following information precisely. 
-    IMPORTANT: Only proceed if this is clearly an invoice with billing information.
+    
     
     Fields to extract:
     1. The company name (look at the header/title area for the company name providing the service)
@@ -156,7 +193,7 @@ def extract_invoice_data(image, page_num):
        ["INVOICE#:","ORIGINAL INVOICE", "Invoice Number:", "Invoice No:", "Tracking Number:", "Pro#", etc.]
     
     3. The order number (look for any of these labels ): 
-       ["SHIPPER NUMBER", "SHIPPER", "Order Number:", "Order No:", "Reference Number:", "ORD", "ORD#", "BILL TO", etc.] 
+       ["SHIPPER NUMBER", "SHIPPER", "Order Number:", "Order No:", "Reference Number:", "ORD", "ORD#", "BILL TO", "B/L" etc.] 
     
     4. The customer PO number (look for any of these labels ): 
        ["P.O. NUMBER", "PO#:", "PO Number:", "Purchase Order:", "Customer PO:", etc.]
@@ -165,20 +202,17 @@ def extract_invoice_data(image, page_num):
        ["PLEASE PAY THIS AMOUNT", "Total Due:", "Total:", "Amount Due:", "Balance Due:", "Total Amount:", etc.]
     
     VALIDATION: Before extracting, verify this is an actual invoice:
-    - Must have "INVOICE" in the header
+    - check the all labels for the each field mentioned above
+    - Must have "INVOICE" in the header of the document
     - Must have billing/charging information
     - Must not be a delivery receipt or packing slip
     
-    If this is NOT a valid invoice page, return:
-    {
-      "page_no": [PAGE NUMBER],
-      "is_valid_invoice": false,
-      "Trucking Company name": null,
-      "Order number": null,
-      "Tracking number": null,
-      "Customer Po number": null,
-      "Total Charges": null
-    }
+    CRITICAL MAPPING RULES:
+    - INVOICE# → Tracking number
+    - SHIPPER NUMBER → Order number  
+    - P.O. NUMBER → Customer Po number
+    - PLEASE PAY THIS AMOUNT → Total Charges
+
     
     If this IS a valid invoice, return the information in this JSON format:
     {
@@ -200,23 +234,35 @@ def extract_invoice_data(image, page_num):
     - If you see multiple potential matches for a field, use the label mentioned above or the most relevant one
     """
     
-    # FIXED: Single deterministic extraction to avoid inconsistent results
-    max_retries = 5  # Increased for reliability
+    max_retries = 5
     
     for attempt in range(max_retries):
         try:
-            # Use fresh chat session for consistency
-            chat = model.start_chat()
-            response = chat.send_message([
-                prompt,
-                {
-                    "mime_type": "image/png",
-                    "data": image_base64
-                }
-            ])
+            response = client.chat.completions.create(
+                model= model, # Using available model instead of the requested one
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_base64}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=2000,
+                temperature=0.1,
+            )
             
-            # Clean response text to remove any markdown or code block formatting
-            response_text = response.text.strip()
+            # Get response text
+            response_text = response.choices[0].message.content.strip()
             
             # Remove markdown formatting
             if response_text.startswith("```json"):
@@ -240,7 +286,7 @@ def extract_invoice_data(image, page_num):
                 else:
                     raise e
             
-            # ADDED: Check if this is marked as invalid invoice
+            # Check if this is marked as invalid invoice
             if result.get("is_valid_invoice") == False:
                 return {
                     "page_no": page_num,
@@ -269,7 +315,7 @@ def extract_invoice_data(image, page_num):
             elif result["Total Charges"] and isinstance(result["Total Charges"], str) and not result["Total Charges"].startswith("$"):
                 result["Total Charges"] = f"${result['Total Charges']}"
             
-            # ADDED: Validate that we have meaningful data
+            # Validate that we have meaningful data
             meaningful_fields = [
                 result.get("Trucking Company name"),
                 result.get("Tracking number"), 
@@ -295,7 +341,7 @@ def extract_invoice_data(image, page_num):
                 print(f"Failed to extract data after {max_retries} attempts")
                 return {
                     "error": "Failed to parse invoice data",
-                    "raw_response": response.text if 'response' in locals() else "No response",
+                    "raw_response": response.choices[0].message.content if 'response' in locals() else "No response",
                     "page_no": page_num,
                     "is_valid_invoice": False
                 }
@@ -311,16 +357,12 @@ def extract_invoice_data(image, page_num):
 def recheck_null_fields(image, page_num, current_data, null_fields):
     """Re-extract only the null fields from a specific page"""
     
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    # buffered = io.BytesIO()
+    # image.save(buffered, format="PNG")
+    # image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
     
-    # FIXED: Consistent temperature
-    generation_config = {"temperature": 0.0, "max_output_tokens": 1000}
-    model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
-        generation_config=generation_config,
-    )
+    resized_image, image_base64 = resize_image_for_llm(image)
+
     
     # Create focused prompt for only the null fields
     field_descriptions = {
@@ -352,16 +394,30 @@ def recheck_null_fields(image, page_num, current_data, null_fields):
     """
     
     try:
-        chat = model.start_chat()
-        response = chat.send_message([
-            prompt,
-            {
-                "mime_type": "image/png",
-                "data": image_base64
-            }
-        ])
+        response = client.chat.completions.create(
+            model= model,  # Using available model instead of the requested one
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1000,
+            temperature=0.1,
+        )
         
-        response_text = response.text.strip()
+        response_text = response.choices[0].message.content.strip()
         if response_text.startswith("```json"):
             response_text = response_text[7:]
         if response_text.startswith("```"):
@@ -378,6 +434,7 @@ def recheck_null_fields(image, page_num, current_data, null_fields):
         print(f"Page {page_num} - Recheck failed: {str(e)}")
         return {field: None for field in null_fields}
 
+
 def process_pdf_invoices(pdf_path):
     # Convert PDF to images
     page_count, images = pdf_to_images(pdf_path)
@@ -391,19 +448,20 @@ def process_pdf_invoices(pdf_path):
         page_num = i + 1
         print(f"Processing page {page_num}...")
         
-        # ADDED: If we already found a primary invoice, be more strict about additional pages
+        # If we already found a primary invoice, be more strict about additional pages
         if found_primary_invoice:
             print(f"Page {page_num} - Primary invoice already found, checking if this is a valid secondary invoice...")
         
         try:
-            # ENHANCED: Check if the page is an invoice with better validation
+            # Check if the page is an invoice with better validation
             if is_invoice_page(image):
                 print(f"Page {page_num} is identified as an invoice. Extracting data...")
                 
                 # Extract data from the invoice
                 invoice_data = extract_invoice_data(image, page_num)
                 
-                # ADDED: Check if extraction marked this as invalid
+                
+                # Check if extraction marked this as invalid
                 if invoice_data.get("is_valid_invoice") == False:
                     print(f"Page {page_num} - Marked as invalid invoice during extraction. Skipping...")
                     continue
@@ -416,7 +474,7 @@ def process_pdf_invoices(pdf_path):
                 )
                 
                 if has_meaningful_data:
-                    # ADDED: Check for duplicate invoice detection
+                    # Check for duplicate invoice detection
                     if found_primary_invoice:
                         # Check if this is a duplicate of already found invoice
                         existing_tracking = [r.get("Tracking number") for r in results if r.get("Tracking number")]
@@ -442,7 +500,7 @@ def process_pdf_invoices(pdf_path):
             print(f"Error processing page {page_num}: {str(e)}")
             continue
     
-    # ADDED: Filter out invalid invoices before processing
+    # Filter out invalid invoices before processing
     valid_results = [r for r in results if r.get("is_valid_invoice") != False]
     
     if not valid_results:
@@ -457,9 +515,9 @@ def process_pdf_invoices(pdf_path):
     # Final null validation - check and fill null values
     final_results = final_null_validation(cleaned_results, images)
     
-    # ADDED: Final deduplication check
-    final_results = remove_duplicate_invoices(final_results)
-    
+    # Final deduplication check
+    # final_results = remove_duplicate_invoices(final_results)
+
     return final_results
 
 def validate_and_cleanup_data(invoice_data_list):
@@ -599,6 +657,11 @@ def process_invoice():
         pdf_document.close()
         print(f"PDF has {page_count} pages")
         
+        cost_per_image = 0.000405
+        pages_with_2_calls = 0
+        pages_with_1_call = 0
+        total_api_calls = 0
+        
         # Process each page
         results = []
         
@@ -616,6 +679,9 @@ def process_invoice():
                     print(f"Page {page_num} is identified as an invoice. Extracting data...")
                     
                     invoice_data = extract_invoice_data(image, page_num)
+                    
+                    pages_with_2_calls += 1
+                    total_api_calls += 2
                     
                     # ADDED: Check if extraction marked this as invalid
                     if invoice_data.get("is_valid_invoice") == False:
@@ -651,6 +717,9 @@ def process_invoice():
                 else:
                     print(f"Page {page_num} is not an invoice. Skipping...")
                     
+                    pages_with_1_call += 1
+                    total_api_calls += 1
+                    
             except Exception as e:
                 print(f"Error processing page {page_num}: {str(e)}")
                 continue
@@ -669,27 +738,25 @@ def process_invoice():
         final_data = final_null_validation(cleaned_data, image_list)
         
         # ADDED: Final deduplication check
-        final_data = remove_duplicate_invoices(final_data)
+        # final_data = remove_duplicate_invoices(final_data)
         
         print(f"Found {len(final_data)} valid unique invoice(s) in the PDF")
         
+        total_cost = total_api_calls * cost_per_image
+        print("\n" + "="*50)
+        print("💰 COST CALCULATION SUMMARY")
+        print("="*50)
+        print(f"📄 Total pages processed: {page_count}")
+        print(f"📋 Invoice pages (2 calls): {pages_with_2_calls}")
+        print(f"📄 Non-invoice pages (1 call): {pages_with_1_call}")
+        print(f"🔄 Total API calls: {total_api_calls}")
+        print(f"💵 Cost per image: ${cost_per_image}")
+        print(f"💰 TOTAL COST: ${total_cost:.6f}")
+        print(f"✅ Successfully extracted: {len(final_data)} invoices")
+        print("="*50)
+        
         return jsonify(final_data)
         
-        # valid_results = [r for r in results if r.get("is_valid_invoice") != False]
-        
-        # if not valid_results:
-        #     print("No valid invoices found in the PDF")
-        #     return jsonify([])
-        
-        # # Validate and clean up the data
-        # cleaned_data = validate_and_cleanup_data(valid_results)
-        
-        # # Final null validation - check and fill null values
-        # final_data = final_null_validation(cleaned_data, image_list)
-        
-        # print(f"Found {len(final_data)} valid invoices in the PDF")
-        
-        # return jsonify(final_data)
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
