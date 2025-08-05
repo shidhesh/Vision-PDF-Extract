@@ -188,31 +188,54 @@ def extract_invoice_data(image, page_num):
     
     
     Fields to extract:
-    1. The company name (look at the header/title area for the company name providing the service)
-    
-    2. The tracking number / invoice number (look for any of these labels): 
-       ["INVOICE#:","ORIGINAL INVOICE", "Invoice Number:", "Invoice No:", "Tracking Number:", "Pro#"]
-    
-    3. The order number (look for any of these labels ): 
-       ["SHIPPER NUMBER", "SHIPPER", "Order Number:", "Order No:", "Reference Number:", "ORD", "ORD#", "B/L"] 
-    
-    4. The customer PO number (look for any of these labels ): 
-       ["P.O. NUMBER", "PO#:", "PO Number:", "Purchase Order:", "Customer PO:"]
-    
-    5. The total charges amount (look for any of these labels ): 
-       ["PLEASE PAY THIS AMOUNT", "Total Due:", "Total:", "Amount Due:", "Balance Due:", "Total Amount:"]
+    1. **Company Name**: Extract from header/logo area - the company providing the trucking service
+   
+    2. **Tracking/Invoice Number**: Look for these EXACT labels:
+        - "INVOICE #:" or "INVOICE#:"
+        - "ORIGINAL INVOICE"  
+        - "Invoice Number:" or "Invoice No:"
+        - "Tracking Number:" or "Pro#"
+        - Extract the alphanumeric code that follows these labels
+
+    3. **Order Number** (Shipper-related): Look for these EXACT labels ONLY:
+        - "SHIPPER NUMBER" or "SHIPPER:"
+        - "Shipper Number:"
+        - "Order Number:" or "Order No:"
+        - "Reference Number:" 
+        - "ORD" or "ORD#"
+        - "B/L" (Bill of Lading)
+        - CRITICAL: DO NOT use any field labeled with "PO" for this
+
+    4. **Customer PO Number**: Look for these EXACT labels ONLY:
+        - "P.O. NUMBER" or "PO#:"
+        - "PO Number:" or "PO:"
+        - "Purchase Order:"
+        - "Customer PO:"
+        - CRITICAL: DO NOT use Shipper numbers for this field
+        - must be in the format of a PO number (alphanumeric, only letters, only numbers) not sentences or words
+
+    5. **Total Charges**: Look for these EXACT labels:
+        - "REMIT AMT:" 
+        - "PLEASE PAY THIS AMOUNT"
+        - "Total Due:" or "Total:"
+        - "Amount Due:" or "Balance Due:"
+        - "SHIPMENT TOTAL:"
+        - "TOTAL AMOUNT:"
+        - "INVOICE TOTAL:"
+        - Extract with dollar sign ($)
     
     VALIDATION: Before extracting, verify this is an actual invoice:
     - check the all labels for the each field mentioned above
     - Must have "INVOICE" in the header of the document
     - Must have billing/charging information
     - Must not be a delivery receipt or packing slip
-    
-     CRITICAL DISAMBIGUATION RULES:
+
+    CRITICAL DISAMBIGUATION RULES:
     - If you see "PO Number:" or "PO:" → This goes to "Customer Po number" field
     - If you see "Shipper Number:" or "Shipper:" → This goes to "Order number" field  
     - DO NOT put PO numbers in the Order number field
     - DO NOT put Shipper numbers in the Customer Po number field
+    - If field appears in multiple locations, use the value from the main invoice area
     
     Critical Rule:
     - Always check for the labels mentioned above before extracting any field
@@ -229,13 +252,13 @@ def extract_invoice_data(image, page_num):
     
     If this IS a valid invoice, return the information in this JSON format:
     {
-      "page_no": [PAGE NUMBER],
-      "is_valid_invoice": true,
-      "Trucking Company name": [COMPANY NAME],
-      "Order number": [ORDER NUMBER],            // do not consider PO number as order number
-      "Tracking number": [INVOICE/TRACKING NUMBER],
-      "Customer Po number": [PO NUMBER],
-      "Total Charges": [TOTAL AMOUNT WITH DOLLAR SIGN]
+        "page_no": [PAGE NUMBER],
+        "is_valid_invoice": true,
+        "Trucking Company name": "[EXACT COMPANY NAME]",
+        "Order number": "[SHIPPER/ORDER NUMBER ONLY]",  // do not consider PO number as order number
+        "Tracking number": "[INVOICE/TRACKING NUMBER]", 
+        "Customer Po number": "[PO NUMBER ONLY]",
+        "Total Charges": "[AMOUNT WITH $ SIGN]"
     }
     
     IMPORTANT INSTRUCTIONS: 
