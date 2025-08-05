@@ -15,11 +15,12 @@ load_dotenv()
 
 app = Flask(__name__)
 
-model = "gpt-4.1-mini-2025-04-14"  
+# model = "gpt-4.1-mini-2025-04-14"  
+model = "gpt-4.1-2025-04-14" 
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def resize_image_for_llm(image, max_size=(800, 800), quality=95):
+def resize_image_for_llm(image, max_size=(900, 900), quality=95):
     """Resize image to fit within max_size box while maintaining aspect ratio"""
     original_size = image.size
     print(f"Original image size: {original_size}")
@@ -183,23 +184,23 @@ def extract_invoice_data(image, page_num):
     resized_image, image_base64 = resize_image_for_llm(image)
     
     prompt = """
-    Analyze this invoice image and extract the following information precisely. 
+    You are Expert to analyze this invoice image and extract the following information precisely. 
     
     
     Fields to extract:
     1. The company name (look at the header/title area for the company name providing the service)
     
     2. The tracking number / invoice number (look for any of these labels): 
-       ["INVOICE#:","ORIGINAL INVOICE", "Invoice Number:", "Invoice No:", "Tracking Number:", "Pro#", etc.]
+       ["INVOICE#:","ORIGINAL INVOICE", "Invoice Number:", "Invoice No:", "Tracking Number:", "Pro#"]
     
     3. The order number (look for any of these labels ): 
-       ["SHIPPER NUMBER", "SHIPPER", "Order Number:", "Order No:", "Reference Number:", "ORD", "ORD#", "BILL TO", "B/L" etc.] 
+       ["SHIPPER NUMBER", "SHIPPER", "Order Number:", "Order No:", "Reference Number:", "ORD", "ORD#", "B/L"] 
     
     4. The customer PO number (look for any of these labels ): 
-       ["P.O. NUMBER", "PO#:", "PO Number:", "Purchase Order:", "Customer PO:", etc.]
+       ["P.O. NUMBER", "PO#:", "PO Number:", "Purchase Order:", "Customer PO:"]
     
     5. The total charges amount (look for any of these labels ): 
-       ["PLEASE PAY THIS AMOUNT", "Total Due:", "Total:", "Amount Due:", "Balance Due:", "Total Amount:", etc.]
+       ["PLEASE PAY THIS AMOUNT", "Total Due:", "Total:", "Amount Due:", "Balance Due:", "Total Amount:"]
     
     VALIDATION: Before extracting, verify this is an actual invoice:
     - check the all labels for the each field mentioned above
@@ -207,19 +208,31 @@ def extract_invoice_data(image, page_num):
     - Must have billing/charging information
     - Must not be a delivery receipt or packing slip
     
-    CRITICAL MAPPING RULES:
-    - INVOICE# → Tracking number
-    - SHIPPER NUMBER → Order number  
-    - P.O. NUMBER → Customer Po number
-    - PLEASE PAY THIS AMOUNT → Total Charges
-
+     CRITICAL DISAMBIGUATION RULES:
+    - If you see "PO Number:" or "PO:" → This goes to "Customer Po number" field
+    - If you see "Shipper Number:" or "Shipper:" → This goes to "Order number" field  
+    - DO NOT put PO numbers in the Order number field
+    - DO NOT put Shipper numbers in the Customer Po number field
+    
+    Critical Rule:
+    - Always check for the labels mentioned above before extracting any field
+    - Map the correct/exact label to the exact field, do not guess or assume
+    - PO number and Order number are different, do not confuse or mix them 
+    
+    Mapping Rules:
+    - for "Customer Po number" --> The customer PO number (point 4)
+    - for "Trucking Company name" --> The company name (point 1)
+    - for "Order number" --> The order number (point 3)             // do not consider PO number as order number
+    - for "Tracking/invoice number" --> The tracking number (point 2)
+    - for "Total Charges" --> The total charges amount (point 5)
+    
     
     If this IS a valid invoice, return the information in this JSON format:
     {
       "page_no": [PAGE NUMBER],
       "is_valid_invoice": true,
       "Trucking Company name": [COMPANY NAME],
-      "Order number": [ORDER NUMBER],
+      "Order number": [ORDER NUMBER],            // do not consider PO number as order number
       "Tracking number": [INVOICE/TRACKING NUMBER],
       "Customer Po number": [PO NUMBER],
       "Total Charges": [TOTAL AMOUNT WITH DOLLAR SIGN]
@@ -229,9 +242,11 @@ def extract_invoice_data(image, page_num):
     - Follow the as is rule for field extraction as mentioned above
     - for each field, look for the mentioned labels in the document
     - Do NOT include any markdown formatting like ```json or ``` in your response
-    - Check each field carefully and ensure it is the most relevant/exact match
+    - Check each field carefully and ensure it is the label exact match
     - Include the dollar sign ($) with the Total Charges
-    - If you see multiple potential matches for a field, use the label mentioned above or the most relevant one
+
+    
+    **Strictly follow the above rules, do not hallucinate on any field extraction or do not repeat the labels in your response.**
     """
     
     max_retries = 5
@@ -258,7 +273,7 @@ def extract_invoice_data(image, page_num):
                     }
                 ],
                 max_tokens=2000,
-                temperature=0.1,
+                temperature=0.1, 
             )
             
             # Get response text
@@ -366,11 +381,11 @@ def recheck_null_fields(image, page_num, current_data, null_fields):
     
     # Create focused prompt for only the null fields
     field_descriptions = {
-        "Trucking Company name": "Extracted from the header/title area of the document.",
-        "Order number": "order/shipper number (labels: SHIPPER NUMBER, SHIPPER, Order Number:, Order No:, Reference Number:, ORD, ORD#, BILL TO)",
-        "Tracking number": "invoice/tracking number (labels: INVOICE#:, ORIGINAL INVOICE, Invoice Number:, Invoice No:, Tracking Number:, Pro#)",
-        "Customer Po number": "PO number (labels: P.O. NUMBER, PO#:, PO Number:, Purchase Order:, Customer PO:)",
-        "Total Charges": "total amount (labels: PLEASE PAY THIS AMOUNT, Total Due:, Total:, Amount Due:, Balance Due:, Total Amount:)"
+        "Trucking Company name": "company name from the header/title area of the document (the company providing the service)",
+        "Order number": "order/shipper number (look for labels: SHIPPER NUMBER, SHIPPER:, Shipper Number:, Order Number, Order No, Reference Number, ORD, ORD#, B/L) - EXCLUDE any PO labels",
+        "Tracking number": "invoice/tracking number (look for labels: INVOICE#, ORIGINAL INVOICE, Invoice Number, Invoice No, Tracking Number, Pro#)",
+        "Customer Po number": "PO number ONLY (look for labels: P.O. NUMBER, PO#:, PO Number:, PO:, Purchase Order, Customer PO) - DO NOT use Shipper numbers",
+        "Total Charges": "total amount to be paid (look for labels: PLEASE PAY THIS AMOUNT, REMIT AMT:, Total Due, Total, Amount Due, Balance Due, Total Amount)"
     }
     
     missing_fields = []
@@ -657,7 +672,7 @@ def process_invoice():
         pdf_document.close()
         print(f"PDF has {page_count} pages")
         
-        cost_per_image = 0.000405
+        cost_per_image = 0.00153  # Cost per image in USD
         pages_with_2_calls = 0
         pages_with_1_call = 0
         total_api_calls = 0
