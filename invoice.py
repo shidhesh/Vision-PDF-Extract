@@ -212,7 +212,6 @@ def extract_invoice_data(image, page_num):
         - "Purchase Order:"
         - "Customer PO:"
         - CRITICAL: DO NOT use Shipper numbers for this field
-        - must be in the format of a PO number (alphanumeric, only letters, only numbers) not sentences or words
 
     5. **Total Charges**: Look for these EXACT labels:
         - "REMIT AMT:" 
